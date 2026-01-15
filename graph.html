@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scrollable Grid Graph + Intersections</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; }
+    h2 { margin: 0 0 12px; }
+    .wrap { display: grid; grid-template-columns: 360px 1fr; gap: 16px; align-items: start; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; }
+    canvas { width: 100%; height: 560px; border: 1px solid #ddd; border-radius: 12px; background: #fff; display:block; touch-action: none; }
+
+    label { display:block; font-size: 12px; color:#444; margin-top: 10px; }
+    select, button { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid #ccc; margin-top: 6px; }
+    button { cursor: pointer; border: none; background: #111; color: #fff; }
+    button.secondary { background: #f3f3f3; color:#111; border: 1px solid #ddd; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .hint { font-size: 12px; color:#555; line-height: 1.35; margin-bottom: 8px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; white-space: pre-wrap; }
+    hr { border:none; border-top:1px solid #eee; margin:14px 0; }
+    .small { font-size: 12px; color:#666; }
+  </style>
+</head>
+
+<body>
+  <h2>Scrollable Grid Graph + Line Intersections ✨</h2>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="hint">
+        <b>Drag</b> to move the grid (pan). <b>Scroll</b> to zoom.<br>
+        Hover shows where the point will land (grid corners only). Click to place.<br>
+        You can’t place two points in the same spot.
+      </div>
+
+      <label>Points</label>
+      <select id="pointsList" size="8"></select>
+      <button class="secondary" id="deletePoint">Delete selected point</button>
+
+      <hr>
+
+      <label>Line A (pick 2 points)</label>
+      <div class="row">
+        <select id="a1"></select>
+        <select id="a2"></select>
+      </div>
+
+      <label>Line B (pick 2 points)</label>
+      <div class="row">
+        <select id="b1"></select>
+        <select id="b2"></select>
+      </div>
+
+      <button id="solve">Draw + find intersection</button>
+      <button class="secondary" id="reset">Reset all</button>
+
+      <hr>
+
+      <div class="small">
+        Controls:
+        <div class="mono">Drag = pan   |   Wheel/trackpad = zoom   |   Click = place point</div>
+      </div>
+
+      <label>Result</label>
+      <div id="result" class="mono">Hover to preview a point.</div>
+    </div>
+
+    <canvas id="c"></canvas>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  const pointsList = document.getElementById("pointsList");
+  const a1 = document.getElementById("a1");
+  const a2 = document.getElementById("a2");
+  const b1 = document.getElementById("b1");
+  const b2 = document.getElementById("b2");
+  const resultEl = document.getElementById("result");
+
+  // ----- world / view -----
+  // We use a "camera" with a center point and a scale (pixels per 1 unit).
+  const GRID_STEP = 1;         // corners of squares => integers
+  const BOLD_EVERY = 5;        // thicker line every 5 units
+  const MIN_SCALE = 12;        // px per unit
+  const MAX_SCALE = 220;
+
+  let cam = {
+    cx: 0,     // center x in world units
+    cy: 0,     // center y in world units
+    scale: 42  // pixels per 1 world unit
+  };
+
+  // ----- data -----
+  let points = []; // {id, x, y}
+  let nextId = 1;
+
+  let preview = null; // {x,y, occupied}
+  let currentIntersection = null;
+
+  const EPS = 1e-12;
+
+  function setResult(t) { resultEl.textContent = t; }
+
+  function cssSize() {
+    const r = canvas.getBoundingClientRect();
+    return { w: r.width, h: r.height };
+  }
+
+  // world -> canvas
+  function worldToCanvas(x, y) {
+    const { w, h } = cssSize();
+    const px = (x - cam.cx) * cam.scale + w / 2;
+    const py = (cam.cy - y) * cam.scale + h / 2;
+    return { px, py };
+  }
+
+  // canvas -> world
+  function canvasToWorld(px, py) {
+    const { w, h } = cssSize();
+    const x = (px - w / 2) / cam.scale + cam.cx;
+    const y = cam.cy - (py - h / 2) / cam.scale;
+    return { x, y };
+  }
+
+  function snapToCorner(n) {
+    return Math.round(n / GRID_STEP) * GRID_STEP;
+  }
+
+  function sameSpot(x, y) {
+    return points.some(p => p.x === x && p.y === y);
+  }
+
+  function getPointById(id) {
+    return points.find(p => String(p.id) === String(id)) || null;
+  }
+
+  function refreshSelects() {
+    pointsList.innerHTML = "";
+    for (const p of points) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = `P${p.id}: (${p.x}, ${p.y})`;
+      pointsList.appendChild(opt);
+    }
+
+    function fill(sel) {
+      const prev = sel.value;
+      sel.innerHTML = `<option value="">—</option>`;
+      for (const p of points) {
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        opt.textContent = `P${p.id}`;
+        sel.appendChild(opt);
+      }
+      sel.value = ([...sel.options].some(o => o.value === prev)) ? prev : "";
+    }
+
+    [a1,a2,b1,b2].forEach(fill);
+  }
+
+  // ----- line math (ax + by = c) -----
+  function lineFromPoints(p, q) {
+    const a = q.y - p.y;
+    const b = p.x - q.x;
+    const c = a * p.x + b * p.y;
+    return { a, b, c };
+  }
+
+  function intersect(L1, L2) {
+    const det = L1.a * L2.b - L2.a * L1.b;
+    if (Math.abs(det) < EPS) {
+      const same =
+        Math.abs(L1.a * L2.c - L2.a * L1.c) < 1e-9 &&
+        Math.abs(L1.b * L2.c - L2.b * L1.c) < 1e-9;
+      return { type: same ? "same" : "parallel" };
+    }
+    const x = (L1.c * L2.b - L2.c * L1.b) / det;
+    const y = (L1.a * L2.c - L2.a * L1.c) / det;
+    return { type: "point", x, y };
+  }
+
+  // ----- drawing -----
+  function resizeCanvas() {
+    const rect = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+
+  function clear() {
+    const { w, h } = cssSize();
+    ctx.clearRect(0, 0, w, h);
+  }
+
+  function drawGrid() {
+    const { w, h } = cssSize();
+
+    // visible world bounds
+    const left = cam.cx - (w / 2) / cam.scale;
+    const right = cam.cx + (w / 2) / cam.scale;
+    const bottom = cam.cy - (h / 2) / cam.scale;
+    const top = cam.cy + (h / 2) / cam.scale;
+
+    // start lines on integer boundaries
+    const xStart = Math.floor(left / GRID_STEP) * GRID_STEP;
+    const xEnd = Math.ceil(right / GRID_STEP) * GRID_STEP;
+    const yStart = Math.floor(bottom / GRID_STEP) * GRID_STEP;
+    const yEnd = Math.ceil(top / GRID_STEP) * GRID_STEP;
+
+    // verticals
+    for (let x = xStart; x <= xEnd; x += GRID_STEP) {
+      const bold = (x % BOLD_EVERY === 0);
+      ctx.strokeStyle = bold ? "#e2e2e2" : "#f0f0f0";
+      ctx.lineWidth = bold ? 2 : 1;
+
+      const { px } = worldToCanvas(x, 0);
+      ctx.beginPath();
+      ctx.moveTo(px, 0);
+      ctx.lineTo(px, h);
+      ctx.stroke();
+    }
+
+    // horizontals
+    for (let y = yStart; y <= yEnd; y += GRID_STEP) {
+      const bold = (y % BOLD_EVERY === 0);
+      ctx.strokeStyle = bold ? "#e2e2e2" : "#f0f0f0";
+      ctx.lineWidth = bold ? 2 : 1;
+
+      const { py } = worldToCanvas(0, y);
+      ctx.beginPath();
+      ctx.moveTo(0, py);
+      ctx.lineTo(w, py);
+      ctx.stroke();
+    }
+
+    // axes
+    ctx.strokeStyle = "#cfcfcf";
+    ctx.lineWidth = 3;
+
+    // y-axis x=0
+    {
+      const { px } = worldToCanvas(0, 0);
+      ctx.beginPath();
+      ctx.moveTo(px, 0);
+      ctx.lineTo(px, h);
+      ctx.stroke();
+    }
+    // x-axis y=0
+    {
+      const { py } = worldToCanvas(0, 0);
+      ctx.beginPath();
+      ctx.moveTo(0, py);
+      ctx.lineTo(w, py);
+      ctx.stroke();
+    }
+
+    // labels every 5 (only if zoomed enough so it doesn't clutter)
+    if (cam.scale >= 24) {
+      ctx.fillStyle = "#666";
+      ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+
+      // x labels along top-ish
+      const xLabStart = Math.floor(left / BOLD_EVERY) * BOLD_EVERY;
+      const xLabEnd = Math.ceil(right / BOLD_EVERY) * BOLD_EVERY;
+      for (let x = xLabStart; x <= xLabEnd; x += BOLD_EVERY) {
+        if (x === 0) continue;
+        const { px } = worldToCanvas(x, 0);
+        ctx.fillText(String(x), px + 4, 14);
+      }
+
+      // y labels along left-ish
+      const yLabStart = Math.floor(bottom / BOLD_EVERY) * BOLD_EVERY;
+      const yLabEnd = Math.ceil(top / BOLD_EVERY) * BOLD_EVERY;
+      for (let y = yLabStart; y <= yLabEnd; y += BOLD_EVERY) {
+        if (y === 0) continue;
+        const { py } = worldToCanvas(0, y);
+        ctx.fillText(String(y), 6, py - 6);
+      }
+    }
+  }
+
+  function drawPoints() {
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    for (const p of points) {
+      const { px, py } = worldToCanvas(p.x, p.y);
+
+      ctx.fillStyle = "#111";
+      ctx.beginPath();
+      ctx.arc(px, py, 5, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillText(`P${p.id}`, px + 8, py - 8);
+    }
+  }
+
+  function drawLineInfinite(p, q, strokeStyle) {
+    // Draw the line clipped to the visible world rect
+    const { w, h } = cssSize();
+
+    const left = cam.cx - (w / 2) / cam.scale;
+    const right = cam.cx + (w / 2) / cam.scale;
+    const bottom = cam.cy - (h / 2) / cam.scale;
+    const top = cam.cy + (h / 2) / cam.scale;
+
+    const L = lineFromPoints(p, q);
+    const hits = [];
+
+    // x = left/right => y = (c - a x) / b
+    if (Math.abs(L.b) > EPS) {
+      let y = (L.c - L.a * left) / L.b;
+      if (y >= bottom - 1e-9 && y <= top + 1e-9) hits.push({ x: left, y });
+
+      y = (L.c - L.a * right) / L.b;
+      if (y >= bottom - 1e-9 && y <= top + 1e-9) hits.push({ x: right, y });
+    }
+
+    // y = bottom/top => x = (c - b y) / a
+    if (Math.abs(L.a) > EPS) {
+      let x = (L.c - L.b * bottom) / L.a;
+      if (x >= left - 1e-9 && x <= right + 1e-9) hits.push({ x, y: bottom });
+
+      x = (L.c - L.b * top) / L.a;
+      if (x >= left - 1e-9 && x <= right + 1e-9) hits.push({ x, y: top });
+    }
+
+    // unique
+    const uniq = [];
+    for (const hpt of hits) {
+      if (!uniq.some(u => Math.hypot(u.x - hpt.x, u.y - hpt.y) < 1e-6)) uniq.push(hpt);
+    }
+    if (uniq.length < 2) return;
+
+    const A = worldToCanvas(uniq[0].x, uniq[0].y);
+    const B = worldToCanvas(uniq[1].x, uniq[1].y);
+
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(A.px, A.py);
+    ctx.lineTo(B.px, B.py);
+    ctx.stroke();
+  }
+
+  function drawIntersection(ix) {
+    if (!ix || ix.type !== "point") return;
+    const { px, py } = worldToCanvas(ix.x, ix.y);
+
+    ctx.strokeStyle = "#e11";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(px - 8, py);
+    ctx.lineTo(px + 8, py);
+    ctx.moveTo(px, py - 8);
+    ctx.lineTo(px, py + 8);
+    ctx.stroke();
+
+    ctx.fillStyle = "#e11";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+    ctx.fillText(`I (${ix.x.toFixed(3)}, ${ix.y.toFixed(3)})`, px + 10, py + 14);
+  }
+
+  function drawPreview() {
+    if (!preview) return;
+    const { px, py } = worldToCanvas(preview.x, preview.y);
+
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = preview.occupied ? "#e11" : "#111";
+    ctx.beginPath();
+    ctx.arc(px, py, 10, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.fillStyle = preview.occupied ? "#e11" : "#111";
+    ctx.beginPath();
+    ctx.arc(px, py, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function draw() {
+    clear();
+    drawGrid();
+
+    const A1 = getPointById(a1.value);
+    const A2 = getPointById(a2.value);
+    const B1 = getPointById(b1.value);
+    const B2 = getPointById(b2.value);
+
+    if (A1 && A2 && A1.id !== A2.id) drawLineInfinite(A1, A2, "#2563eb");
+    if (B1 && B2 && B1.id !== B2.id) drawLineInfinite(B1, B2, "#16a34a");
+
+    drawPoints();
+    drawIntersection(currentIntersection);
+    drawPreview();
+  }
+
+  // ----- interaction: hover preview + place + pan + zoom -----
+  let isDragging = false;
+  let dragMoved = false;
+  let dragStart = null; // {x,y} pointer in canvas px, cx,cy in world
+  let pointerIdDown = null;
+
+  function updatePreviewFromClient(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+
+    let { x, y } = canvasToWorld(px, py);
+    x = snapToCorner(x);
+    y = snapToCorner(y);
+
+    const occupied = sameSpot(x, y);
+    preview = { x, y, occupied };
+
+    setResult(
+      occupied
+        ? `That spot (${x}, ${y}) is already taken ❌`
+        : `Ready to place at (${x}, ${y}) ✅`
+    );
+
+    draw();
+  }
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (isDragging && dragStart && e.pointerId === pointerIdDown) {
+      const rect = canvas.getBoundingClientRect();
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+
+      const dxPx = px - dragStart.px;
+      const dyPx = py - dragStart.py;
+
+      // move camera opposite direction of drag
+      cam.cx = dragStart.cx - dxPx / cam.scale;
+      cam.cy = dragStart.cy + dyPx / cam.scale;
+
+      if (Math.abs(dxPx) > 2 || Math.abs(dyPx) > 2) dragMoved = true;
+
+      // while dragging, hide preview to avoid “oops placed” vibes
+      preview = null;
+      setResult("Panning… (release to place points again)");
+      draw();
+      return;
+    }
+
+    updatePreviewFromClient(e.clientX, e.clientY);
+  });
+
+  canvas.addEventListener("pointerleave", () => {
+    if (!isDragging) {
+      preview = null;
+      setResult("Hover to preview a point.");
+      draw();
+    }
+  });
+
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    pointerIdDown = e.pointerId;
+
+    isDragging = true;
+    dragMoved = false;
+
+    const rect = canvas.getBoundingClientRect();
+    dragStart = {
+      px: e.clientX - rect.left,
+      py: e.clientY - rect.top,
+      cx: cam.cx,
+      cy: cam.cy
+    };
+  });
+
+  canvas.addEventListener("pointerup", (e) => {
+    if (e.pointerId !== pointerIdDown) return;
+    isDragging = false;
+
+    // If we didn't really drag, treat it like a click-to-place
+    if (!dragMoved) {
+      updatePreviewFromClient(e.clientX, e.clientY);
+      if (!preview) return;
+
+      if (preview.occupied) {
+        setResult(`Nope — there’s already a point at (${preview.x}, ${preview.y}).`);
+        return;
+      }
+
+      points.push({ id: nextId++, x: preview.x, y: preview.y });
+      refreshSelects();
+      currentIntersection = null;
+
+      setResult(`Placed P${points[points.length - 1].id} at (${preview.x}, ${preview.y}).`);
+      draw();
+      return;
+    }
+
+    // after dragging, restore hover preview next move
+    preview = null;
+    setResult("Hover to preview a point.");
+    draw();
+  });
+
+  // Zoom with wheel/trackpad, zoom toward cursor position
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+
+    // world point under cursor BEFORE zoom
+    const before = canvasToWorld(px, py);
+
+    // zoom factor (trackpad friendly)
+    const zoomFactor = Math.exp(-e.deltaY * 0.0015);
+    cam.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, cam.scale * zoomFactor));
+
+    // world point under cursor AFTER zoom
+    const after = canvasToWorld(px, py);
+
+    // adjust camera center so the cursor stays on same world point
+    cam.cx += (before.x - after.x);
+    cam.cy += (before.y - after.y);
+
+    // hide preview while zooming to prevent confusion
+    preview = null;
+    setResult("Zooming…");
+    draw();
+  }, { passive: false });
+
+  // ----- UI buttons -----
+  document.getElementById("deletePoint").addEventListener("click", () => {
+    const id = pointsList.value;
+    if (!id) return;
+
+    points = points.filter(p => String(p.id) !== String(id));
+    [a1,a2,b1,b2].forEach(sel => { if (sel.value === id) sel.value = ""; });
+
+    refreshSelects();
+    currentIntersection = null;
+
+    // update preview occupied flag if needed
+    if (preview) preview.occupied = sameSpot(preview.x, preview.y);
+
+    setResult(`Deleted P${id}.`);
+    draw();
+  });
+
+  document.getElementById("solve").addEventListener("click", () => {
+    const A1 = getPointById(a1.value);
+    const A2 = getPointById(a2.value);
+    const B1 = getPointById(b1.value);
+    const B2 = getPointById(b2.value);
+
+    if (!A1 || !A2 || A1.id === A2.id) {
+      currentIntersection = null;
+      setResult("Line A needs two different points.");
+      draw();
+      return;
+    }
+    if (!B1 || !B2 || B1.id === B2.id) {
+      currentIntersection = null;
+      setResult("Line B needs two different points.");
+      draw();
+      return;
+    }
+
+    const ix = intersect(lineFromPoints(A1, A2), lineFromPoints(B1, B2));
+    currentIntersection = ix;
+
+    if (ix.type === "point") {
+      setResult(`Intersection:\nx = ${ix.x.toFixed(6)}\ny = ${ix.y.toFixed(6)}`);
+    } else if (ix.type === "parallel") {
+      setResult("No intersection: the lines are parallel.");
+    } else {
+      setResult("Infinite intersections: the two lines are the same line.");
+    }
+    draw();
+  });
+
+  document.getElementById("reset").addEventListener("click", () => {
+    points = [];
+    nextId = 1;
+    [a1,a2,b1,b2].forEach(sel => sel.value = "");
+    currentIntersection = null;
+    preview = null;
+
+    cam.cx = 0;
+    cam.cy = 0;
+    cam.scale = 42;
+
+    refreshSelects();
+    setResult("Reset done. Hover to preview a point.");
+    draw();
+  });
+
+  // ----- init -----
+  window.addEventListener("resize", resizeCanvas);
+  refreshSelects();
+  resizeCanvas();
+})();
+</script>
+</body>
+</html>
